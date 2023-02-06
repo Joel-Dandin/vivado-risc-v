@@ -21,13 +21,14 @@ for DEVICE in `ls /dev/disk/by-path/*-usb-*-scsi-*` ; do
   echo
   DEVICE=`realpath $DEVICE`
   echo "Copy disk image to:"
-  sudo sfdisk -l $DEVICE
+  sudo sfdisk -l $DEVICE || continue
   read -r -p "Are you sure? [y/N] " response
   case "$response" in
   [yY][eE][sS]|[yY])
     sudo dd if=$SD_IMG of=$DEVICE bs=64K status=progress
     sudo sync
     sudo partprobe ${DEVICE}
+    sleep 3
     echo ", +" | sudo sfdisk -N 2 ${DEVICE}
     sudo partprobe ${DEVICE}
     sudo fsck -f ${DEVICE}2
