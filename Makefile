@@ -18,7 +18,7 @@ apt-install:
 	sudo apt update
 	sudo apt upgrade
 	sudo apt install default-jdk device-tree-compiler python curl gawk \
-	 libtinfo5 libmpc-dev libssl-dev gcc gcc-riscv64-linux-gnu gcc-8-riscv64-linux-gnu flex bison
+	 libtinfo5 libmpc-dev libssl-dev gcc gcc-riscv64-linux-gnu flex bison
 
 apt-install-qemi:
 	sudo apt install qemu-system-misc opensbi u-boot-qemu qemu-utils
@@ -55,14 +55,14 @@ workspace/gcc/riscv: workspace/gcc/tools.tar.gz
 debian-riscv64/initrd:
 	mkdir -p debian-riscv64
 	curl --netrc --location --header 'Accept: application/octet-stream' \
-	  https://api.github.com/repos/eugene-tarassov/vivado-risc-v/releases/assets/83694315 \
+	  https://api.github.com/repos/eugene-tarassov/vivado-risc-v/releases/assets/106930233 \
 	  -o $@.tmp
 	mv $@.tmp $@
 
 debian-riscv64/rootfs.tar.gz:
 	mkdir -p debian-riscv64
 	curl --netrc --location --header 'Accept: application/octet-stream' \
-	  https://api.github.com/repos/eugene-tarassov/vivado-risc-v/releases/assets/83694317 \
+	  https://api.github.com/repos/eugene-tarassov/vivado-risc-v/releases/assets/106930236 \
 	  -o $@.tmp
 	mv $@.tmp $@
 
@@ -113,7 +113,8 @@ endif
 
 workspace/patch-u-boot-done: u-boot/configs/vivado_riscv64_defconfig
 	if [ -s patches/u-boot.patch ] ; then cd u-boot && ( git apply -R --check ../patches/u-boot.patch 2>/dev/null || git apply ../patches/u-boot.patch ) ; fi
-	cp -p -r patches/u-boot/vivado_riscv64 u-boot/board/xilinx
+	mkdir -p u-boot/board/vivado_riscv
+	cp -p -r patches/u-boot/vivado_riscv64 u-boot/board/vivado_riscv
 	cp -p patches/u-boot/vivado_riscv64.h u-boot/include/configs
 	mkdir -p workspace && touch workspace/patch-u-boot-done
 
@@ -121,7 +122,7 @@ u-boot/u-boot-nodtb.bin: workspace/patch-u-boot-done $(U_BOOT_SRC)
 	make -C u-boot CROSS_COMPILE=$(CROSS_COMPILE_LINUX) BOARD=vivado_riscv64 vivado_riscv64_config
 	make -C u-boot \
 	  BOARD=vivado_riscv64 \
-	  CC=$(CROSS_COMPILE_LINUX)gcc-8 \
+	  CC=$(CROSS_COMPILE_LINUX)gcc \
 	  CROSS_COMPILE=$(CROSS_COMPILE_LINUX) \
 	  KCFLAGS='-O1 -gno-column-info' \
 	  all
@@ -293,7 +294,7 @@ workspace/$(CONFIG)/system-$(BOARD).tcl: workspace/$(CONFIG)/rocket.vhdl workspa
 vivado-tcl: workspace/$(CONFIG)/system-$(BOARD).tcl
 
 $(proj_time): workspace/$(CONFIG)/system-$(BOARD).tcl
-	if [ ! -e $(proj_path) ] ; then $(vivado) -source workspace/$(CONFIG)/system-$(BOARD).tcl ; fi
+	if [ ! -e $(proj_path) ] ; then $(vivado) -source workspace/$(CONFIG)/system-$(BOARD).tcl || ( rm -rf $(proj_path) ; exit 1 ) ; fi
 	date >$@
 
 vivado-project: $(proj_time)
