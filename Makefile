@@ -12,19 +12,43 @@ CFG_FORMAT ?= mcs
 
 include board/$(BOARD)/Makefile.inc
 
+all: bitstream
+
+# --- docker ---------------
+
+DOCKER_VIVADO_VERSION ?= 2023.2
+DOCKER_ARGS ?=
+
+docker-image:
+	cd docker && docker build --build-arg HOST_UID=`id -u` --build-arg HOST_GID=`id -g` --build-arg VIVADO_VERSION=$(DOCKER_VIVADO_VERSION) --tag vivado-risc-v-tools:$(DOCKER_VIVADO_VERSION) .
+
+docker-shell:
+	docker container run --interactive --tty --rm --volume .:/src $(DOCKER_ARGS) --user `id -u`:`id -g` vivado-risc-v-tools:$(DOCKER_VIVADO_VERSION) bash --login || true
+
 # --- packages and repos ---
 
 apt-install:
 	sudo apt update
 	sudo apt upgrade
-	sudo apt install default-jdk device-tree-compiler python curl gawk \
-	 libtinfo5 libmpc-dev libssl-dev gcc gcc-riscv64-linux-gnu flex bison
+	sudo apt install default-jdk device-tree-compiler curl gawk \
+	 libtinfo5 libmpc-dev libssl-dev gcc gcc-riscv64-linux-gnu flex bison bc parted udev dosfstools
+ifeq ($(shell test -r /etc/os-release && . /etc/os-release && echo $$VERSION_CODENAME),jammy)
+	sudo apt install python-is-python3
+else
+	sudo apt install python
+endif
 
 apt-install-qemi:
 	sudo apt install qemu-system-misc opensbi u-boot-qemu qemu-utils
 
 # skip submodules which are not needed and take long time to update
 SKIP_SUBMODULES = torture software/gemmini-rocc-tests software/onnxruntime-riscv
+
+update:
+	git pull --no-recurse-submodules
+	rm -rf workspace/patch-*-done
+	git submodule sync --recursive
+	git $(foreach m,$(SKIP_SUBMODULES),-c submodule.$(m).update=none) submodule update --init --force --recursive
 
 update-submodules:
 	rm -rf workspace/patch-*-done
@@ -35,9 +59,13 @@ clean-submodules:
 	git submodule foreach --recursive git clean -xfdq
 	rm -rf workspace/patch-*-done
 
+clean-sbt:
+	rm -rf ~/.cache ~/.config/jgit ~/.ivy2 ~/.sbt
+
 clean:
+	rm -rf workspace/patch-*-done
 	git submodule foreach --recursive git clean -xfdq
-	sudo rm -rf debian-riscv64 workspace/patch-*-done
+	sudo rm -rf debian-riscv64 target project/target project/project/target generators/targetutils/target vhdl-wrapper/bin
 
 # --- download gcc, initrd and rootfs from github.com ---
 
@@ -55,14 +83,14 @@ workspace/gcc/riscv: workspace/gcc/tools.tar.gz
 debian-riscv64/initrd:
 	mkdir -p debian-riscv64
 	curl --netrc --location --header 'Accept: application/octet-stream' \
-	  https://api.github.com/repos/eugene-tarassov/vivado-risc-v/releases/assets/106930233 \
+	  https://api.github.com/repos/eugene-tarassov/vivado-risc-v/releases/assets/158580561 \
 	  -o $@.tmp
 	mv $@.tmp $@
 
 debian-riscv64/rootfs.tar.gz:
 	mkdir -p debian-riscv64
 	curl --netrc --location --header 'Accept: application/octet-stream' \
-	  https://api.github.com/repos/eugene-tarassov/vivado-risc-v/releases/assets/106930236 \
+	  https://api.github.com/repos/eugene-tarassov/vivado-risc-v/releases/assets/158580569 \
 	  -o $@.tmp
 	mv $@.tmp $@
 
@@ -182,18 +210,20 @@ else
   MEMORY_ADDR_RANGE64 = 0x0 0x80000000 $(shell echo - | awk '{CPU=$(MEMORY_SIZE_CPU); DDR=$(MEMORY_SIZE); $(MEMORY_SIZE_AWK)}')
 endif
 
-SBT := java -Xmx12G -Xss8M $(JAVA_OPTIONS) -Dsbt.io.virtual=false -Dsbt.server.autostart=false -jar $(realpath rocket-chip/sbt-launch.jar)
+SBT := java -Xmx12G -Xss8M $(JAVA_OPTIONS) -Dsbt.io.virtual=false -Dsbt.server.autostart=false -jar $(realpath sbt-launch.jar)
 
 CHISEL_SRC_DIRS = \
   src/main \
   rocket-chip/src/main \
+  rocket-chip/macros/src/main \
+  rocket-chip/hardfloat/src/main \
   generators/gemmini/src/main \
   generators/riscv-boom/src/main \
   generators/sifive-cache/design/craft \
   generators/testchipip/src/main
 
-CHISEL_SRC := $(foreach path, $(CHISEL_SRC_DIRS), $(shell test -d $(path) && find $(path) -iname "*.scala"))
-FIRRTL = java -Xmx12G -Xss8M $(JAVA_OPTIONS) -cp target/scala-2.12/classes:rocket-chip/rocketchip.jar firrtl.stage.FirrtlMain
+CHISEL_SRC := $(foreach path, $(CHISEL_SRC_DIRS), $(shell test -d $(path) && find $(path) -iname "*.scala" -not -name ".*"))
+FIRRTL = java -Xmx12G -Xss8M $(JAVA_OPTIONS) -cp `realpath target/scala-*/system.jar` firrtl.stage.FirrtlMain
 
 workspace/patch-hdl-done:
 	if [ -s patches/ethernet.patch ] ; then cd ethernet/verilog-ethernet && ( git apply -R --check ../../patches/ethernet.patch 2>/dev/null || git apply ../../patches/ethernet.patch ) ; fi
@@ -207,13 +237,12 @@ workspace/patch-hdl-done:
 workspace/$(CONFIG)/system.dts: $(CHISEL_SRC) rocket-chip/bootrom/bootrom.img workspace/patch-hdl-done
 	mkdir -p workspace/$(CONFIG)/tmp
 	cp rocket-chip/bootrom/bootrom.img workspace/bootrom.img
-	$(SBT) "runMain freechips.rocketchip.system.Generator -td workspace/$(CONFIG)/tmp -T Vivado.RocketSystem -C Vivado.$(CONFIG_SCALA)"
-	mv workspace/$(CONFIG)/tmp/Vivado.$(CONFIG_SCALA).anno.json workspace/$(CONFIG)/system.anno.json
+	$(SBT) "runMain freechips.rocketchip.diplomacy.Main --dir `realpath workspace/$(CONFIG)/tmp` --top Vivado.RocketSystem --config Vivado.$(CONFIG_SCALA)"
 	mv workspace/$(CONFIG)/tmp/Vivado.$(CONFIG_SCALA).dts workspace/$(CONFIG)/system.dts
 	rm -rf workspace/$(CONFIG)/tmp
 
 # Generate board specific device tree, boot ROM and FIRRTL
-workspace/$(CONFIG)/system-$(BOARD)/Vivado.$(CONFIG_SCALA).fir: workspace/$(CONFIG)/system.dts $(wildcard bootrom/*) workspace/gcc/riscv
+workspace/$(CONFIG)/system-$(BOARD)/RocketSystem.fir: workspace/$(CONFIG)/system.dts $(wildcard bootrom/*) workspace/gcc/riscv
 	mkdir -p workspace/$(CONFIG)/system-$(BOARD)
 	cat workspace/$(CONFIG)/system.dts board/$(BOARD)/bootrom.dts >bootrom/system.dts
 	sed -i "s#reg = <0x80000000 *0x.*>#reg = <$(MEMORY_ADDR_RANGE32)>#g" bootrom/system.dts
@@ -226,21 +255,17 @@ workspace/$(CONFIG)/system-$(BOARD)/Vivado.$(CONFIG_SCALA).fir: workspace/$(CONF
 	make -C bootrom CROSS_COMPILE="$(CROSS_COMPILE_NO_OS_TOOLS)" CFLAGS="$(CROSS_COMPILE_NO_OS_FLAGS)" BOARD=$(BOARD) clean bootrom.img
 	mv bootrom/system.dts workspace/$(CONFIG)/system-$(BOARD).dts
 	mv bootrom/bootrom.img workspace/bootrom.img
-	$(SBT) "runMain freechips.rocketchip.system.Generator -td workspace/$(CONFIG)/system-$(BOARD) -T Vivado.RocketSystem -C Vivado.$(CONFIG_SCALA)"
-	cd rocket-chip && $(SBT) assembly
+	$(SBT) "runMain freechips.rocketchip.diplomacy.Main --dir `realpath workspace/$(CONFIG)/system-$(BOARD)` --top Vivado.RocketSystem --config Vivado.$(CONFIG_SCALA)"
+	$(SBT) assembly
 	rm workspace/bootrom.img
 
 # Generate Rocket SoC HDL
-workspace/$(CONFIG)/system-$(BOARD).v: workspace/$(CONFIG)/system-$(BOARD)/Vivado.$(CONFIG_SCALA).fir
-	$(FIRRTL) -i $< -o system-$(BOARD).v -X verilog --infer-rw RocketSystem --repl-seq-mem \
-	  -c:RocketSystem:-o:`realpath workspace/$(CONFIG)/srams.conf` \
-	  -faf `realpath workspace/$(CONFIG)/system.anno.json` \
-	  -td workspace/$(CONFIG)/ \
-	  -fct firrtl.passes.InlineInstances
-
-# Generate HDL for Rocket Chip RAM blocks
-workspace/$(CONFIG)/srams.v: workspace/$(CONFIG)/system-$(BOARD).v
-	./mk-srams workspace/$(CONFIG)/srams.conf >workspace/$(CONFIG)/srams.v
+workspace/$(CONFIG)/system-$(BOARD).v: workspace/$(CONFIG)/system-$(BOARD)/RocketSystem.fir
+	$(FIRRTL) -i $< -o RocketSystem.v --compiler verilog \
+	  --annotation-file workspace/$(CONFIG)/system-$(BOARD)/RocketSystem.anno.json \
+	  --custom-transforms firrtl.passes.InlineInstances \
+	  --target:fpga
+	cp workspace/$(CONFIG)/system-$(BOARD)/RocketSystem.v workspace/$(CONFIG)/system-$(BOARD).v
 
 # Generate Rocket SoC wrapper for Vivado
 workspace/$(CONFIG)/rocket.vhdl: workspace/$(CONFIG)/system-$(BOARD).v
@@ -276,11 +301,11 @@ proj_file   = $(proj_path)/$(proj_name).xpr
 proj_time   = $(proj_path)/timestamp.txt
 synthesis   = $(proj_path)/$(proj_name).runs/synth_1/riscv_wrapper.dcp
 bitstream   = $(proj_path)/$(proj_name).runs/impl_1/$(FPGA_FNM)
-memcfg_file = workspace/$(CONFIG)/$(proj_name).$(CFG_FORMAT)
+cfgmem_file = workspace/$(CONFIG)/$(proj_name).$(CFG_FORMAT)
 prm_file    = workspace/$(CONFIG)/$(proj_name).prm
 vivado      = env XILINX_LOCAL_USER_DATA=no vivado -mode batch -nojournal -nolog -notrace -quiet
 
-workspace/$(CONFIG)/system-$(BOARD).tcl: workspace/$(CONFIG)/rocket.vhdl workspace/$(CONFIG)/srams.v
+workspace/$(CONFIG)/system-$(BOARD).tcl: workspace/$(CONFIG)/rocket.vhdl workspace/$(CONFIG)/system-$(BOARD).v
 	echo "set vivado_board_name $(BOARD)" >$@
 	if [ "$(BOARD_PART)" != "" -a "$(BOARD_PART)" != "NONE" ] ; then echo "set vivado_board_part $(BOARD_PART)" >>$@ ; fi
 	if [ "$(BOARD_CONFIG)" != "" ] ; then echo "set board_config $(BOARD_CONFIG)" >>$@ ; fi
@@ -305,9 +330,9 @@ vivado-project: $(proj_time)
 MAX_THREADS ?= 1
 
 $(synthesis): $(proj_time)
+	echo "set_param general.maxThreads $(MAX_THREADS)" >>$(proj_path)/make-synthesis.tcl
 	echo "open_project $(proj_file)" >$(proj_path)/make-synthesis.tcl
 	echo "update_compile_order -fileset sources_1" >>$(proj_path)/make-synthesis.tcl
-	echo "set_param general.maxThreads $(MAX_THREADS)" >>$(proj_path)/make-synthesis.tcl
 	echo "reset_run synth_1" >>$(proj_path)/make-synthesis.tcl
 	echo "launch_runs -jobs $(MAX_THREADS) synth_1" >>$(proj_path)/make-synthesis.tcl
 	echo "wait_on_run synth_1" >>$(proj_path)/make-synthesis.tcl
@@ -315,29 +340,35 @@ $(synthesis): $(proj_time)
 	if find $(proj_path) -name "*.log" -exec cat {} \; | grep 'ERROR: ' ; then exit 1 ; fi
 
 $(bitstream): $(synthesis)
-	echo "open_project $(proj_file)" >$(proj_path)/make-bitstream.tcl
 	echo "set_param general.maxThreads $(MAX_THREADS)" >>$(proj_path)/make-bitstream.tcl
+	echo "open_project $(proj_file)" >$(proj_path)/make-bitstream.tcl
 	echo "reset_run impl_1" >>$(proj_path)/make-bitstream.tcl
 	echo "launch_runs -to_step write_bitstream -jobs $(MAX_THREADS) impl_1" >>$(proj_path)/make-bitstream.tcl
 	echo "wait_on_run impl_1" >>$(proj_path)/make-bitstream.tcl
 	$(vivado) -source $(proj_path)/make-bitstream.tcl
 	if find $(proj_path) -name "*.log" -exec cat {} \; | grep 'ERROR: ' ; then exit 1 ; fi
 
-$(memcfg_file) $(prm_file): $(bitstream) workspace/boot.elf
+ifeq ($(CFG_BOOT),)
+  CFG_FILES=$(bitstream)
+else
+  CFG_FILES=$(bitstream) workspace/boot.elf
+endif
+
+$(cfgmem_file) $(prm_file): $(CFG_FILES)
 	echo "open_project $(proj_file)" >$(proj_path)/make-mcs.tcl
-	echo "write_cfgmem -format $(CFG_FORMAT) -interface $(CFG_DEVICE) -loadbit {up 0x0 $(bitstream)} $(CFG_BOOT) -file $(memcfg_file) -force" >>$(proj_path)/make-mcs.tcl
+	echo "write_cfgmem -format $(CFG_FORMAT) -interface $(CFG_DEVICE) -loadbit {up 0x0 $(bitstream)} $(CFG_BOOT) -file $(cfgmem_file) -force" >>$(proj_path)/make-mcs.tcl
 	$(vivado) -source $(proj_path)/make-mcs.tcl
 
-bitstream: $(bitstream) $(memcfg_file)
+bitstream: $(bitstream) $(cfgmem_file)
 
 # --- program flash memory ---
 
-flash: $(memcfg_file) $(prm_file)
+flash: $(cfgmem_file) $(prm_file)
 	env HW_SERVER_URL=tcp:$(HW_SERVER_ADDR) \
 	 xsdb -quiet board/jtag-freq.tcl
 	env HW_SERVER_ADDR=$(HW_SERVER_ADDR) \
 	env CFG_PART=$(CFG_PART) \
-	env mcs_file=$(memcfg_file) \
+	env mcs_file=$(cfgmem_file) \
 	env prm_file=$(prm_file) \
 	 $(vivado) -source board/program-flash.tcl
 
